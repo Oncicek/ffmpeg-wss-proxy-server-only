@@ -1,0 +1,12 @@
+{
+  "name": "ffmpeg-wss-proxy-server-only",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server-dev.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
