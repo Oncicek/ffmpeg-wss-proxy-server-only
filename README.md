@@ -1,54 +1,48 @@
-# ffmpeg-wss-proxy (server-only, no Docker/TLS)
+# 🎧 WS PCM → RTP/Opus Bridge
 
-A tiny Node.js WebSocket → FFmpeg bridge for local testing. No frontend included.
+A lightweight Node.js server that ingests **PCM S16LE (48 kHz, mono)** audio over **WebSocket** and streams it as **low-latency Opus via RTP**.  
+Includes an SDP endpoint so you can monitor live audio using `ffplay`.
 
-## Requirements
-- Node.js 18+
-- `ffmpeg` available on PATH
+---
 
-## Install & Run
+## 🚀 Features
+
+- Ingests raw PCM (16-bit mono, 48 kHz) over WebSocket
+- Encodes to Opus (10 ms frames, low-delay mode) using FFmpeg
+- Streams via RTP (PT = 97) to a configurable IP/port
+- Serves an SDP file at `/live.sdp` for playback
+- Includes a `/health` endpoint for status checks
+
+---
+
+## 🧰 Requirements
+
+- Node.js 18 or newer
+- FFmpeg with `libopus` support installed and in your system path
+
+Examples:
+
+- macOS → `brew install ffmpeg`
+- Linux → `sudo apt install ffmpeg`
+- Windows → [Download FFmpeg](https://ffmpeg.org/download.html)
+
+---
+
+## ⚙️ Installation
+
 ```bash
-npm install
-npm start
-# server: ws://localhost:3000/ingest
-# health: http://localhost:3000/health
+# Create and enter a directory
+mkdir ws-pcm-rtp && cd ws-pcm-rtp
+
+# Initialize and install dependencies
+npm init -y
+npm install ws
 ```
 
-## Usage (from your own client later)
-Connect a binary WebSocket to `ws://localhost:3000/ingest` and send audio frames.
+listen locally via:
 
-### Input formats
-- `?format=pcm` — raw **s16le** at 48kHz, `CHANNELS` mono by default.
-- `?format=webm` — **MediaRecorder** WebM/Opus chunks.
-- `?format=opus` — raw Opus (you must packetize/encode on the client).
-
-### Output modes
-- Files (default): `OUTPUT_MODE=file` writes `./data/out/record-<uuid>.ogg`
-- RTP: `OUTPUT_MODE=rtp` + `RTP_URL=rtp://127.0.0.1:5004`
-- RTMP: `OUTPUT_MODE=rtmp` + `RTMP_URL=rtmp://.../app/key`
-
-You can also pass `?out=file|rtp|rtmp` on the WS URL to override per-session.
-
-### Environment variables
-```
-PORT=3000
-WS_PATH=/ingest
-AUTH_TOKEN=secret             # optional
-INPUT_FORMAT=pcm              # pcm | webm | opus
-OUTPUT_MODE=file              # file | rtp | rtmp
-OUTPUT_PATH=./data/out        # for file mode
-RTP_URL=rtp://127.0.0.1:5004  # for rtp mode
-RTMP_URL=rtmp://host/app/key  # for rtmp mode
-SAMPLE_RATE=48000
-CHANNELS=1
-```
-
-### Example URLs
-```
-ws://localhost:3000/ingest?format=pcm
-ws://localhost:3000/ingest?format=webm&out=file
-```
-
-## Notes
-- This is for local dev only (plain WS, no TLS).
-- Backpressure is minimal; for production, add a ring buffer.
+ffplay -nodisp \
+ -fflags nobuffer -flags low_delay \
+ -probesize 32 -analyzeduration 0 \
+ -protocol_whitelist "file,udp,rtp,tcp,http,https" \
+ http://localhost:8000/live.sdp

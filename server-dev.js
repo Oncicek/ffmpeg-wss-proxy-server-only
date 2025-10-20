@@ -94,7 +94,7 @@ wss.on("connection", (ws, req) => {
     "-application",
     "lowdelay",
     "-b:a",
-    "96k",
+    "64k",
     "-frame_duration",
     "10",
 
