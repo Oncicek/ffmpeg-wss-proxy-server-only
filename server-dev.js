@@ -1,19 +1,25 @@
+// server.js
 import http from "http";
 import { spawn } from "node:child_process";
 import { WebSocketServer } from "ws";
+import url from "url";
 
 const {
   PORT = "8000",
   WS_PATH = "/ingest",
   SAMPLE_RATE = "48000",
-  CHANNELS = "1", // 1=mono (recommended for talk)
+  CHANNELS = "1", // 1 = mono
   RTP_URL = "rtp://127.0.0.1:5004",
+  BITRATE = "24k", // speech-friendly default
+  PING_INTERVAL_MS = "15000",
+  MAX_MSG_BYTES = (256 * 1024).toString(), // drop absurdly large messages
 } = process.env;
 
 function parseRtpUrl(u = RTP_URL) {
   const m = (u || "").match(/^rtp:\/\/([^:\/]+):(\d+)/i);
   return { ip: m ? m[1] : "127.0.0.1", port: m ? parseInt(m[2], 10) : 5004 };
 }
+
 function buildOpusSdp({ ip, port, channels }) {
   return [
     "v=0",
@@ -21,10 +27,12 @@ function buildOpusSdp({ ip, port, channels }) {
     "s=Live Opus RTP",
     `c=IN IP4 ${ip}`,
     "t=0 0",
-    // PT=97 (must match ffmpeg -payload_type)
-    `m=audio ${port} RTP/AVP 97`,
+    "m=audio " + port + " RTP/AVP 97",
     `a=rtpmap:97 opus/48000/${channels}`,
-    "a=ptime:10", // 10 ms packets → lower latency
+    "a=ptime:20",
+    "a=maxptime:20",
+    // advertise mono + in-band FEC potential
+    "a=fmtp:97 stereo=0;useinbandfec=1;minptime=10;maxplaybackrate=48000;sprop-maxcapturerate=48000",
     "",
   ].join("\r\n");
 }
@@ -54,68 +62,120 @@ const server = http.createServer((req, res) => {
   res.end("not found");
 });
 
-// --- WS ingest → ffmpeg RTP/Opus ---
+// --- WS ingest → ffmpeg RTP/Opus (speech-optimized) ---
 const wss = new WebSocketServer({ server, path: WS_PATH });
 
 wss.on("connection", (ws, req) => {
-  console.log("[ws] open from", req.socket.remoteAddress);
+  const { query } = url.parse(req.url, true);
+  const format = query && query.format ? String(query.format) : "pcm"; // "pcm" | "opus-webm" | "opus-ogg"
+  const maxMsg = parseInt(MAX_MSG_BYTES, 10) || 262144;
 
-  // ffmpeg: s16le PCM → Opus (low-latency) → RTP
+  console.log("[ws] open from", req.socket.remoteAddress, "format=", format);
+
+  // Choose ffmpeg INPUT by format
+  const inputArgsByFormat = {
+    // raw PCM S16LE @ 48k mono from the hook
+    pcm: ["-f", "s16le", "-ar", SAMPLE_RATE, "-ac", CHANNELS, "-i", "pipe:0"],
+
+    // Browser MediaRecorder (WebM+Opus) – chunks reset timestamps → fix with genpts/igndts and reset audio PTS
+    "opus-webm": [
+      "-fflags",
+      "+genpts+igndts",
+      "-use_wallclock_as_timestamps",
+      "1",
+      "-f",
+      "webm",
+      "-i",
+      "pipe:0",
+      "-vn",
+      // downmix to mono explicitly; normalize PTS
+      "-af",
+      "pan=mono|c0=0.5*c0+0.5*c1,asetpts=N/SR/TB",
+    ],
+
+    // Browser MediaRecorder (Ogg+Opus) – generally streamable; still normalize PTS
+    "opus-ogg": [
+      "-fflags",
+      "+genpts",
+      "-use_wallclock_as_timestamps",
+      "1",
+      "-f",
+      "ogg",
+      "-i",
+      "pipe:0",
+      "-vn",
+      "-af",
+      "pan=mono|c0=0.5*c0+0.5*c1,asetpts=N/SR/TB",
+    ],
+  };
+
+  const inputArgs = inputArgsByFormat[format] || inputArgsByFormat.pcm;
+
+  // Common low-latency & speech-tuned Opus encoder → RTP
   const args = [
     "-hide_banner",
     "-loglevel",
     "warning",
 
-    // INPUT: s16le PCM 48k mono on stdin
-    "-f",
-    "s16le",
-    "-ar",
-    SAMPLE_RATE,
-    "-ac",
-    CHANNELS,
-    "-i",
-    "pipe:0",
+    ...inputArgs,
 
-    // keep latency low, timestamps aligned to wallclock
+    // keep pipeline snappy
     "-fflags",
     "+nobuffer",
     "-flags",
     "low_delay",
     "-flush_packets",
     "1",
-    "-use_wallclock_as_timestamps",
-    "1",
 
-    // ENCODE: Opus low-latency 10ms frames
+    // ENCODE Opus tuned for voice + resilience
     "-ac",
-    CHANNELS,
+    CHANNELS, // ensure encoder output is mono
     "-c:a",
     "libopus",
     "-application",
-    "lowdelay",
+    "voip",
     "-b:a",
-    "64k",
+    BITRATE, // e.g., 24k
+    "-vbr",
+    "on",
     "-frame_duration",
-    "10",
+    "20",
+    "-packet_loss",
+    "5", // >0 encourages in-band FEC budgeting
 
-    // OUTPUT: RTP with fixed payload type (97) and safe packet size
+    // OUTPUT: RTP with dynamic PT=97
     "-f",
     "rtp",
     "-payload_type",
     "97",
     `${RTP_URL}?pkt_size=1200`,
   ];
+
   const ff = spawn("ffmpeg", args, { stdio: ["pipe", "inherit", "inherit"] });
   ff.on("close", (c, s) => console.log("[ffmpeg] exit code=", c, "sig=", s));
-  ff.stdin.on("error", (e) => console.log("[ffmpeg.stdin] error:", e?.message));
+  ff.stdin.on("error", (e) =>
+    console.log("[ffmpeg.stdin] error:", e && e.message)
+  );
+
+  // Simple backpressure/drop policy
+  let dropUntilDrain = false;
+  ff.stdin.on("drain", () => {
+    dropUntilDrain = false;
+  });
 
   ws.on("message", (data) => {
-    if (!ff.stdin.writable) return;
-    try {
-      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-      ff.stdin.write(buf);
-    } catch (e) {
-      console.log("[ws->ff] write error:", e?.message);
+    if (!ff.stdin.writable || dropUntilDrain) return;
+
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (buf.byteLength > maxMsg) {
+      // drop too-large frames
+      return;
+    }
+
+    const ok = ff.stdin.write(buf);
+    if (!ok) {
+      // buffer full: drop subsequent messages until drain
+      dropUntilDrain = true;
     }
   });
 
@@ -123,26 +183,49 @@ wss.on("connection", (ws, req) => {
     try {
       ff.stdin.end();
     } catch {}
-    try {
-      ff.kill("SIGTERM");
-    } catch {}
+    const killTimer = setTimeout(() => {
+      try {
+        ff.kill("SIGKILL");
+      } catch {}
+    }, 2000);
+    ff.on("close", () => clearTimeout(killTimer));
   };
+
   ws.on("close", () => {
     console.log("[ws] close");
     stop();
   });
   ws.on("error", (e) => {
-    console.log("[ws] error:", e?.message);
+    console.log("[ws] error:", e && e.message);
     stop();
   });
+
+  // Heartbeat
+  ws.isAlive = true;
+  ws.on("pong", () => (ws.isAlive = true));
+  const interval = setInterval(() => {
+    if (!ws.isAlive) {
+      ws.terminate();
+      return;
+    }
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch {}
+  }, parseInt(PING_INTERVAL_MS, 10) || 15000);
+
+  ws.on("close", () => clearInterval(interval));
+  ws.on("error", () => clearInterval(interval));
 });
 
 server.listen(parseInt(PORT, 10), () => {
   const { ip, port } = parseRtpUrl();
   console.log(
-    `WS ingest : ws://localhost:${PORT}${WS_PATH}  (expects PCM s16le)`
+    `WS ingest : ws://localhost:${PORT}${WS_PATH}  (?format=pcm|opus-webm|opus-ogg)`
   );
   console.log(`SDP       : http://localhost:${PORT}/live.sdp`);
-  console.log(`RTP       : ${RTP_URL} (PT=97, 10ms)`);
+  console.log(
+    `RTP       : ${RTP_URL} (PT=97, 20ms, voip, VBR, ${BITRATE}, FEC budgeting)`
+  );
   console.log(`Health    : http://localhost:${PORT}/health`);
 });
